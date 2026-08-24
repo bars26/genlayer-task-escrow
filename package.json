@@ -1,0 +1,11 @@
+{
+  "name": "genlayer-task-escrow",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "deploy": "genlayer deploy"
+  },
+  "devDependencies": {
+    "genlayer-js": "^1.1.8"
+  }
+}
