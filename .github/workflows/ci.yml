@@ -16,14 +16,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      # `lint` (fast AST pass) has one known false positive on this contract:
-      # the gl.vm.run_nondet_unsafe(leader_fn, validator_fn) pattern used in
-      # _verify_evidence isn't recognized as an equivalence-principle block,
-      # even though it is one (see README's "Known linter note"). The same
-      # warning appears on this repo's own contracts/PatternTest.py, which
-      # uses the identical pattern. `validate` runs the real SDK-based
-      # semantic check and passes cleanly, so that's what gates CI.
-      - run: genvm-lint validate contracts/task_escrow.py
+      - run: genvm-lint check contracts/task_escrow.py
 
   test-direct:
     name: Direct Mode Tests
