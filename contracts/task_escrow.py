@@ -3,7 +3,6 @@
 import json
 from dataclasses import dataclass
 from genlayer import *
-import genlayer.gl.vm as glvm
 
 
 @allow_storage
@@ -27,8 +26,8 @@ class TaskEscrow(gl.Contract):
     def __init__(self):
         self.task_count = u256(0)
 
-    def _verify_evidence(self, description: str, evidence_url: str) -> dict:
-        def leader_fn() -> dict:
+    def _verify_evidence(self, description: str, evidence_url: str) -> bool:
+        def get_verdict() -> str:
             web_data = gl.nondet.web.render(evidence_url, mode="text")
 
             verdict = gl.nondet.exec_prompt(
@@ -42,8 +41,7 @@ Evidence content fetched from the submitted URL:
 Decide whether the evidence demonstrates the task was completed as described.
 Respond in JSON:
 {{
-    "satisfied": bool,
-    "reasoning": str
+    "satisfied": bool
 }}
 It is mandatory that you respond only using the JSON format above,
 nothing else. Don't include any other words or characters,
@@ -52,22 +50,18 @@ This result should be perfectly parsable by a JSON parser without errors.
 """,
                 response_format="json",
             )
-            return {
-                "satisfied": bool(verdict.get("satisfied")),
-                "reasoning": str(verdict.get("reasoning", "")),
-            }
+            # Only the boolean verdict is part of the equivalence-checked
+            # value. Free-text reasoning is deliberately excluded here: two
+            # independent LLM calls (leader and validator) should agree on
+            # *whether* the evidence satisfies the task, but strict_eq
+            # requires byte-identical output, and open-ended text would
+            # rarely match word-for-word between calls.
+            return json.dumps(
+                {"satisfied": bool(verdict.get("satisfied"))}, sort_keys=True
+            )
 
-        def validator_fn(leader_result) -> bool:
-            if not isinstance(leader_result, glvm.Return):
-                return False
-            # Partial field matching: only the "satisfied" verdict needs to
-            # match between leader and validator re-execution. Free-text
-            # "reasoning" is expected to vary in wording between independent
-            # LLM calls, so it is excluded from the consensus comparison.
-            v = leader_fn()
-            return leader_result.calldata["satisfied"] == v["satisfied"]
-
-        return glvm.run_nondet_unsafe(leader_fn, validator_fn)
+        result_json = json.loads(gl.eq_principle.strict_eq(get_verdict))
+        return bool(result_json["satisfied"])
 
     def _is_expired(self, deadline: str) -> bool:
         now_date = str(gl.message_raw["datetime"])[:10]
@@ -119,23 +113,24 @@ This result should be perfectly parsable by a JSON parser without errors.
         task.status = "submitted"
 
     @gl.public.write
-    def resolve_task(self, task_id: str) -> dict:
+    def resolve_task(self, task_id: str) -> bool:
         task = self.tasks[task_id]
         if task.status != "submitted":
             raise gl.vm.UserError("Task has no evidence pending resolution")
 
-        verdict = self._verify_evidence(task.description, task.evidence_url)
-        task.reasoning = str(verdict.get("reasoning", ""))
+        satisfied = self._verify_evidence(task.description, task.evidence_url)
 
-        if bool(verdict.get("satisfied")):
+        if satisfied:
             task.status = "approved"
+            task.reasoning = "Validators agreed the submitted evidence satisfies the task description."
             gl.get_contract_at(task.worker).emit_transfer(
                 value=u256(int(task.amount)), on="finalized"
             )
         else:
             task.status = "rejected"
+            task.reasoning = "Validators agreed the submitted evidence does not satisfy the task description."
 
-        return verdict
+        return satisfied
 
     @gl.public.write
     def reclaim_expired(self, task_id: str) -> None:

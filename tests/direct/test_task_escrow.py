@@ -174,7 +174,7 @@ def test_resolve_task_approves_and_pays_worker(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
     direct_vm.mock_web(r".*example\.com.*", {"status": 200, "body": "Landing page is live and looks great."})
-    direct_vm.mock_llm(r".*", '{"satisfied": true, "reasoning": "The page is live as described."}')
+    direct_vm.mock_llm(r".*", '{"satisfied": true}')
 
     direct_vm.sender = direct_alice
     direct_vm.value = 500
@@ -190,14 +190,14 @@ def test_resolve_task_approves_and_pays_worker(
 
     task = contract.get_task(task_id)
     assert task.status == "approved"
-    assert "live" in task.reasoning.lower()
+    assert "satisfies" in task.reasoning.lower()
 
 
 def test_resolve_task_rejects_and_allows_resubmit(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
     direct_vm.mock_web(r".*example\.com.*", {"status": 200, "body": "This page is empty."})
-    direct_vm.mock_llm(r".*", '{"satisfied": false, "reasoning": "The page has no content."}')
+    direct_vm.mock_llm(r".*", '{"satisfied": false}')
 
     direct_vm.sender = direct_alice
     direct_vm.value = 500
@@ -215,7 +215,7 @@ def test_resolve_task_rejects_and_allows_resubmit(
 
     direct_vm.clear_mocks()
     direct_vm.mock_web(r".*example\.com.*", {"status": 200, "body": "Now the page is live."})
-    direct_vm.mock_llm(r".*", '{"satisfied": true, "reasoning": "The page is live now."}')
+    direct_vm.mock_llm(r".*", '{"satisfied": true}')
 
     contract.submit_evidence(task_id, "https://example.com/proof-v2")
     task = contract.get_task(task_id)

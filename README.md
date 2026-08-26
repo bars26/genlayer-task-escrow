@@ -15,7 +15,7 @@ This is a direct implementation of what GenLayer's own docs call its flagship us
 1. **`create_task(description, deadline)`** — payable. The requester locks GEN as the bounty and describes what counts as complete, in natural language.
 2. **`claim_task(task_id)`** — a worker claims the task, so only one party can submit evidence for it.
 3. **`submit_evidence(task_id, evidence_url)`** — the worker submits a link proving the task is done.
-4. **`resolve_task(task_id)`** — validators fetch `evidence_url` and ask an LLM whether it satisfies `description`. Under the Equivalence Principle, leader and validator nodes each run this check independently and must agree on the `satisfied` verdict (free-text reasoning is allowed to vary in wording — only the boolean matters for consensus). If satisfied, the escrowed amount is transferred to the worker immediately; if not, the task is marked `rejected` and the worker can submit new evidence.
+4. **`resolve_task(task_id)`** — validators fetch `evidence_url` and ask an LLM whether it satisfies `description`. Under the Equivalence Principle (`gl.eq_principle.strict_eq`), leader and validator nodes each run this check independently and must agree on the `satisfied` verdict. If satisfied, the escrowed amount is transferred to the worker immediately; if not, the task is marked `rejected` and the worker can submit new evidence.
 5. **`reclaim_expired(task_id)`** — if the deadline passes without an approved submission, the requester can reclaim the locked funds.
 6. **`cancel_task(task_id)`** — the requester can cancel and get an instant refund, but only before anyone has claimed the task.
 
@@ -65,7 +65,7 @@ pip install -r requirements.txt
 genvm-lint check contracts/task_escrow.py
 ```
 
-> **Known linter note:** the linter flags the two `gl.nondet.*` calls inside `_verify_evidence`'s `leader_fn` as "not reachable from equivalence principle block." This is a false positive — `leader_fn`/`validator_fn` are passed to `gl.vm.run_nondet_unsafe(...)`, which *is* the equivalence-principle wrapper, matching the exact pattern this repo's own `contracts/PatternTest.py` uses (and which triggers the identical warning there). It's a static-analysis gap in the linter, not a contract defect.
+`_verify_evidence`'s `gl.nondet.*` calls live inside `gl.eq_principle.strict_eq(get_verdict)`, one of the linter's recognized equivalence-principle wrappers, so this passes clean with zero warnings.
 
 ### 3. Run direct mode tests
 
@@ -91,7 +91,7 @@ Requires GenLayer Studio running (local or hosted).
 ## Design notes
 
 - **Real escrow, not a points system.** `create_task` is `@gl.public.write.payable` and locks `gl.message.value`; approval pays the worker via `gl.get_contract_at(worker).emit_transfer(value=..., on="finalized")`. Every status transition to a terminal/paid state happens *before* the transfer call (checks-effects-interactions), so a task can't be double-paid.
-- **Consensus on a boolean, not free text.** Rather than requiring leader and validator LLM calls to produce byte-identical JSON (`strict_eq`, brittle for subjective judgments) or relying on `prompt_non_comparative` (not exercisable in this SDK's direct-mode test harness at the time of writing), `_verify_evidence` uses `gl.vm.run_nondet_unsafe` with a custom validator that only compares the `satisfied` boolean between leader and validator re-execution — the "partial field matching" pattern documented in `contracts/PatternTest.py`. This is both testable end-to-end in direct mode and more robust to LLM wording variance than exact-match approaches.
+- **Consensus on a boolean, not free text.** `_verify_evidence` uses `gl.eq_principle.strict_eq`, which requires the leader's and validator's independent LLM calls to produce byte-identical output. To keep that reliable, the LLM is only ever asked for a single-field `{"satisfied": bool}` JSON object — no open-ended reasoning is part of the equivalence-checked value, since free text would rarely match word-for-word between two independent calls. The human-readable `task.reasoning` stored on-chain is a fixed message chosen deterministically in Python from the boolean outcome, not LLM output, so it carries no consensus risk. (An earlier version used `gl.vm.run_nondet_unsafe` with a custom validator that only compared the `satisfied` field — functionally similar, but not recognized as an equivalence-principle block by `genvm-lint`'s static analysis, which only recognizes the `gl.eq_principle.*` convenience wrappers. `prompt_non_comparative` was also considered — it's lint-clean and the documented fit for subjective assessments — but its underlying `ExecPromptTemplate` host call isn't stubbed by this SDK's direct-mode test harness, so the LLM-adjudication path couldn't be tested locally.)
 
 ## Community
 - **[Discord](https://discord.gg/8Jm4v89VAu)**: Discussions, support, and announcements
