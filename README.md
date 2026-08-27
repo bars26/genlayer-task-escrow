@@ -12,19 +12,21 @@ This is a direct implementation of what GenLayer's own docs call its flagship us
 
 ## How it works
 
-1. **`create_task(description, deadline)`** — payable. The requester locks GEN as the bounty and describes what counts as complete, in natural language.
-2. **`claim_task(task_id)`** — a worker claims the task, so only one party can submit evidence for it.
-3. **`submit_evidence(task_id, evidence_url)`** — the worker submits a link proving the task is done.
-4. **`resolve_task(task_id)`** — validators fetch `evidence_url` and ask an LLM whether it satisfies `description`. Under the Equivalence Principle (`gl.eq_principle.strict_eq`), leader and validator nodes each run this check independently and must agree on the `satisfied` verdict. If satisfied, the escrowed amount is transferred to the worker immediately; if not, the task is marked `rejected` and the worker can submit new evidence.
-5. **`reclaim_expired(task_id)`** — if the deadline passes without an approved submission, the requester can reclaim the locked funds.
+1. **`create_task(description, deadline)`** — payable. The requester locks GEN as the bounty and describes what counts as complete, in natural language. `deadline` must be a valid ISO `YYYY-MM-DD` date strictly in the future, or the call reverts.
+2. **`claim_task(task_id)`** — a worker claims the task, so only one party can submit evidence for it. Blocked once the deadline has passed.
+3. **`submit_evidence(task_id, evidence_url)`** — the worker submits a link proving the task is done. Blocked once the deadline has passed.
+4. **`resolve_task(task_id)`** — validators fetch `evidence_url` and ask an LLM whether it satisfies `description`. Under the Equivalence Principle (`gl.eq_principle.strict_eq`), leader and validator nodes each run this check independently and must agree on the `satisfied` verdict, which must be an actual JSON boolean (a malformed response is rejected outright, never coerced). If satisfied, the escrowed amount is transferred to the worker immediately; if not, the task is marked `rejected` and the worker can submit new evidence. Also blocked once the deadline has passed — see below.
+5. **`reclaim_expired(task_id)`** — once the deadline has passed without an approved payout, the requester can reclaim the locked funds.
 6. **`cancel_task(task_id)`** — the requester can cancel and get an instant refund, but only before anyone has claimed the task.
+
+`claim_task`/`submit_evidence`/`resolve_task` all reject once the deadline has passed, so `reclaim_expired` is the *only* path that can move funds after expiry — a worker can no longer race a late approval against the requester's refund.
 
 Views (`get_task`, `list_open_tasks`, `get_tasks_by_requester`, `get_tasks_by_worker`) let a frontend or script list and track tasks without needing an indexer.
 
 ## What's included
 
 - **`contracts/task_escrow.py`** — the Intelligent Contract described above
-- **Direct mode tests** (`tests/direct/test_task_escrow.py`) — 14 fast, in-memory tests covering funding, claiming, evidence submission, LLM-adjudicated approval/rejection, expiry refunds, and cancellation
+- **Direct mode tests** (`tests/direct/test_task_escrow.py`) — 20 fast, in-memory tests covering funding, deadline validation, claiming, evidence submission, LLM-adjudicated approval/rejection, expiry gating on every write path, and cancellation
 - **Contract linting** — static analysis to catch common contract issues before deployment
 - **CI pipeline** — GitHub Actions workflow for linting and direct tests
 - Configuration file template and deployment scripts (`deploy/deployScript.ts`)
@@ -73,7 +75,7 @@ genvm-lint check contracts/task_escrow.py
 pytest tests/direct/ -v
 ```
 
-All 14 tests run in-memory in well under a second, using `direct_vm.mock_web(...)` / `direct_vm.mock_llm(...)` to simulate evidence pages and LLM verdicts, and `direct_vm.warp(...)` to test deadline expiry.
+All 20 tests run in-memory in well under a second, using `direct_vm.mock_web(...)` / `direct_vm.mock_llm(...)` to simulate evidence pages and LLM verdicts. Deadline-expiry tests mutate a task's stored `deadline` directly rather than using `direct_vm.warp(...)`: in this SDK/harness combination, `gl.message_raw["datetime"]` is captured once when `genlayer.gl` is first imported in the test process and isn't refreshed by later `warp()` calls (the same caching `gltest.direct`'s own `_refresh_gl_message` works around for `sender`/`value`, just not extended to `datetime`), so simulating "time passing" that way is unreliable across more than one warp per process.
 
 ### 4. Deploy the contract
 
@@ -92,6 +94,8 @@ Requires GenLayer Studio running (local or hosted).
 
 - **Real escrow, not a points system.** `create_task` is `@gl.public.write.payable` and locks `gl.message.value`; approval pays the worker via `gl.get_contract_at(worker).emit_transfer(value=..., on="finalized")`. Every status transition to a terminal/paid state happens *before* the transfer call (checks-effects-interactions), so a task can't be double-paid.
 - **Consensus on a boolean, not free text.** `_verify_evidence` uses `gl.eq_principle.strict_eq`, which requires the leader's and validator's independent LLM calls to produce byte-identical output. To keep that reliable, the LLM is only ever asked for a single-field `{"satisfied": bool}` JSON object — no open-ended reasoning is part of the equivalence-checked value, since free text would rarely match word-for-word between two independent calls. The human-readable `task.reasoning` stored on-chain is a fixed message chosen deterministically in Python from the boolean outcome, not LLM output, so it carries no consensus risk. (An earlier version used `gl.vm.run_nondet_unsafe` with a custom validator that only compared the `satisfied` field — functionally similar, but not recognized as an equivalence-principle block by `genvm-lint`'s static analysis, which only recognizes the `gl.eq_principle.*` convenience wrappers. `prompt_non_comparative` was also considered — it's lint-clean and the documented fit for subjective assessments — but its underlying `ExecPromptTemplate` host call isn't stubbed by this SDK's direct-mode test harness, so the LLM-adjudication path couldn't be tested locally.)
+- **No coercing the LLM's verdict.** The parsed `"satisfied"` value is checked with `isinstance(satisfied, bool)`, not passed through `bool(...)`. A malformed or adversarial response like `{"satisfied": "false"}` (a non-empty *string*, not a JSON boolean) is truthy under Python's `bool()`, which would silently flip a rejection into an approval — `resolve_task` reverts instead of ever accepting a non-boolean value.
+- **Deadlines are validated, and every payout path respects them.** `create_task` rejects a malformed or non-future `deadline` up front (`datetime.date.fromisoformat`, compared against the current block date). `claim_task`, `submit_evidence`, and `resolve_task` all re-check the deadline and revert once it has passed, so `reclaim_expired` is the only method that can still move funds on an expired task — closing a race where a late `resolve_task` approval and a `reclaim_expired` refund could otherwise both succeed against the same escrowed amount.
 
 ## Community
 - **[Discord](https://discord.gg/8Jm4v89VAu)**: Discussions, support, and announcements

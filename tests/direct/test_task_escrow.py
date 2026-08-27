@@ -147,14 +147,120 @@ def test_reclaim_expired_after_deadline(direct_vm, direct_deploy, direct_alice, 
     direct_vm.sender = direct_alice
     direct_vm.value = 500
     contract = direct_deploy(CONTRACT_PATH)
-    task_id = contract.create_task("Write a blog post", "2024-01-01")
+    task_id = contract.create_task("Write a blog post", "2099-01-01")
 
-    direct_vm.warp("2024-06-01T00:00:00")
+    # direct_vm.warp() only affects the very first contract deploy of the
+    # whole pytest process (genlayer.gl caches gl.message_raw at import
+    # time; later warps don't reach it — see CLAUDE.md notes on caching).
+    # To simulate the deadline having passed without depending on warp or
+    # process/test ordering, mutate the stored deadline directly instead of
+    # moving the clock.
+    contract.tasks[task_id].deadline = "2020-01-01"
+
     direct_vm.sender = direct_alice
     contract.reclaim_expired(task_id)
 
     task = contract.get_task(task_id)
     assert task.status == "refunded"
+
+
+def test_create_task_rejects_malformed_deadline(direct_vm, direct_deploy, direct_alice):
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    contract = direct_deploy(CONTRACT_PATH)
+
+    with direct_vm.expect_revert("Deadline must be a valid ISO date"):
+        contract.create_task("Do something", "31-12-2099")
+
+
+def test_create_task_rejects_past_deadline(direct_vm, direct_deploy, direct_alice):
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    contract = direct_deploy(CONTRACT_PATH)
+
+    with direct_vm.expect_revert("Deadline must be in the future"):
+        contract.create_task("Do something", "2020-01-01")
+
+
+def test_claim_task_blocked_after_deadline(direct_vm, direct_deploy, direct_alice, direct_bob):
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    contract = direct_deploy(CONTRACT_PATH)
+    task_id = contract.create_task("Write a blog post", "2099-01-01")
+    contract.tasks[task_id].deadline = "2020-01-01"  # simulate expiry; see note above
+
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Task deadline has passed"):
+        contract.claim_task(task_id)
+
+
+def test_submit_evidence_blocked_after_deadline(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    contract = direct_deploy(CONTRACT_PATH)
+    task_id = contract.create_task("Write a blog post", "2099-01-01")
+
+    direct_vm.sender = direct_bob
+    contract.claim_task(task_id)
+
+    contract.tasks[task_id].deadline = "2020-01-01"  # simulate expiry; see note above
+    with direct_vm.expect_revert("Task deadline has passed"):
+        contract.submit_evidence(task_id, "https://example.com/proof")
+
+
+def test_resolve_task_blocked_after_deadline(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    direct_vm.mock_web(r".*example\.com.*", {"status": 200, "body": "Done."})
+    direct_vm.mock_llm(r".*", '{"satisfied": true}')
+
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    contract = direct_deploy(CONTRACT_PATH)
+    task_id = contract.create_task("Write a blog post", "2099-01-01")
+
+    direct_vm.sender = direct_bob
+    contract.claim_task(task_id)
+    contract.submit_evidence(task_id, "https://example.com/proof")
+
+    contract.tasks[task_id].deadline = "2020-01-01"  # simulate expiry; see note above
+    with direct_vm.expect_revert("Task deadline has passed"):
+        contract.resolve_task(task_id)
+
+    # The requester can still recover funds once expired, even though
+    # evidence was submitted — resolve_task can no longer pay it out.
+    direct_vm.sender = direct_alice
+    contract.reclaim_expired(task_id)
+    task = contract.get_task(task_id)
+    assert task.status == "refunded"
+
+
+def test_resolve_task_rejects_non_boolean_satisfied_field(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """A malformed LLM response like {"satisfied": "false"} (a string, not a
+    JSON bool) must not be coerced by Python truthiness into an approval —
+    it should be rejected outright."""
+    direct_vm.mock_web(r".*example\.com.*", {"status": 200, "body": "Not done."})
+    direct_vm.mock_llm(r".*", '{"satisfied": "false"}')
+
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    contract = direct_deploy(CONTRACT_PATH)
+    task_id = contract.create_task("Deploy a landing page", "2099-01-01")
+
+    direct_vm.sender = direct_bob
+    contract.claim_task(task_id)
+    contract.submit_evidence(task_id, "https://example.com/proof")
+
+    with direct_vm.expect_revert("must be a JSON boolean"):
+        contract.resolve_task(task_id)
+
+    # Funds must still be locked, not paid out to the worker.
+    task = contract.get_task(task_id)
+    assert task.status == "submitted"
 
 
 def test_list_open_tasks(direct_vm, direct_deploy, direct_alice, direct_bob):

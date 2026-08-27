@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from genlayer import *
 
 
@@ -50,22 +51,50 @@ This result should be perfectly parsable by a JSON parser without errors.
 """,
                 response_format="json",
             )
+            satisfied = verdict.get("satisfied")
+            # Require an actual JSON boolean rather than coercing arbitrary
+            # values with bool(...): a malformed or malicious LLM response
+            # like {"satisfied": "false"} would coerce to True under
+            # Python truthiness (any non-empty string is truthy), silently
+            # flipping a rejection into an approval. Reject anything that
+            # isn't literally true/false instead of guessing.
+            if not isinstance(satisfied, bool):
+                raise gl.vm.UserError(
+                    "LLM response 'satisfied' field must be a JSON boolean"
+                )
+
             # Only the boolean verdict is part of the equivalence-checked
             # value. Free-text reasoning is deliberately excluded here: two
             # independent LLM calls (leader and validator) should agree on
             # *whether* the evidence satisfies the task, but strict_eq
             # requires byte-identical output, and open-ended text would
             # rarely match word-for-word between calls.
-            return json.dumps(
-                {"satisfied": bool(verdict.get("satisfied"))}, sort_keys=True
-            )
+            return json.dumps({"satisfied": satisfied}, sort_keys=True)
 
         result_json = json.loads(gl.eq_principle.strict_eq(get_verdict))
-        return bool(result_json["satisfied"])
+        satisfied = result_json["satisfied"]
+        if not isinstance(satisfied, bool):
+            raise gl.vm.UserError("Equivalence-checked verdict was not a boolean")
+        return satisfied
+
+    def _current_date(self) -> str:
+        return str(gl.message_raw["datetime"])[:10]
 
     def _is_expired(self, deadline: str) -> bool:
-        now_date = str(gl.message_raw["datetime"])[:10]
-        return now_date >= deadline
+        return self._current_date() >= deadline
+
+    def _validate_future_deadline(self, deadline: str) -> None:
+        try:
+            parsed = date.fromisoformat(deadline)
+        except (ValueError, TypeError):
+            raise gl.vm.UserError(
+                "Deadline must be a valid ISO date in YYYY-MM-DD format"
+            )
+        # str(parsed) re-normalizes to zero-padded YYYY-MM-DD so this
+        # compares correctly even if the input had, e.g., single-digit
+        # month/day accepted by fromisoformat in a lenient parser build.
+        if str(parsed) <= self._current_date():
+            raise gl.vm.UserError("Deadline must be in the future")
 
     @gl.public.write.payable
     def create_task(self, description: str, deadline: str) -> str:
@@ -73,6 +102,7 @@ This result should be perfectly parsable by a JSON parser without errors.
             raise gl.vm.UserError("Task must be funded with a positive amount")
         if not description.strip():
             raise gl.vm.UserError("Description cannot be empty")
+        self._validate_future_deadline(deadline)
 
         task_id = f"task_{int(self.task_count)}"
         self.task_count = u256(int(self.task_count) + 1)
@@ -95,6 +125,13 @@ This result should be perfectly parsable by a JSON parser without errors.
         task = self.tasks[task_id]
         if task.status != "open":
             raise gl.vm.UserError("Task is not open for claiming")
+        # Blocking claim/submit/approve once the deadline has passed keeps
+        # reclaim_expired the only path that can move funds after expiry —
+        # otherwise a worker could still get paid via resolve_task in the
+        # same window the requester reclaims via reclaim_expired, racing
+        # two transfers of the same escrowed amount.
+        if self._is_expired(task.deadline):
+            raise gl.vm.UserError("Task deadline has passed; it can no longer be claimed")
 
         task.worker = gl.message.sender_address
         task.status = "claimed"
@@ -108,6 +145,10 @@ This result should be perfectly parsable by a JSON parser without errors.
             raise gl.vm.UserError("Task is not awaiting evidence")
         if not evidence_url.strip():
             raise gl.vm.UserError("Evidence URL cannot be empty")
+        if self._is_expired(task.deadline):
+            raise gl.vm.UserError(
+                "Task deadline has passed; evidence can no longer be submitted"
+            )
 
         task.evidence_url = evidence_url
         task.status = "submitted"
@@ -117,6 +158,10 @@ This result should be perfectly parsable by a JSON parser without errors.
         task = self.tasks[task_id]
         if task.status != "submitted":
             raise gl.vm.UserError("Task has no evidence pending resolution")
+        if self._is_expired(task.deadline):
+            raise gl.vm.UserError(
+                "Task deadline has passed; the requester must use reclaim_expired"
+            )
 
         satisfied = self._verify_evidence(task.description, task.evidence_url)
 
